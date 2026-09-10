@@ -1,0 +1,39 @@
+.App {
+  padding: 20px;
+}
+
+.AppLoading,
+.ConfigurationError {
+  align-items: center;
+  display: flex;
+  gap: 12px;
+  justify-content: center;
+  min-height: 180px;
+  padding: 20px;
+}
+
+.ConfigurationError {
+  align-items: flex-start;
+  flex-direction: column;
+}
+
+.ProficiencyHeader {
+  margin-top: 20px;
+}
+
+.ProficiencyTable {
+  margin-top: 20px;
+}
+
+.ProficiencyActions {
+  margin-top: 20px;
+  max-width: 480px;
+}
+
+.EmphasizedText {
+  font-weight: 700;
+}
+
+.SectionTitle {
+  margin: 0;
+}

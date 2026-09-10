@@ -1,0 +1,118 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Lambda Function URL backend for the Amazon Connect proficiency manager.
+
+Parameters:
+  LambdaCodeBucket:
+    Type: String
+    Description: S3 bucket in this Region containing the Lambda deployment ZIP.
+  LambdaCodeKey:
+    Type: String
+    Default: lambda.zip
+    Description: S3 object key for the Lambda deployment ZIP.
+  ConnectInstanceId:
+    Type: String
+    Default: eefde7f8-7534-4dac-a433-f5a922235cc5
+    Description: Amazon Connect instance identifier.
+  ConnectInstanceArn:
+    Type: String
+    Default: ""
+    Description: >
+      Amazon Connect instance ARN
+      (arn:aws:connect:<region>:<account-id>:instance/<ConnectInstanceId>).
+      Required by the Lambda function at runtime.
+  FrontendOrigin:
+    Type: String
+    Default: "*"
+    Description: CORS origin for the frontend. Use * for open test configuration, or set to your CloudFront domain.
+  AllowedAttributes:
+    Type: String
+    Default: ""
+    Description: >
+      Comma-separated list of predefined attribute names to expose in the app.
+      When set, only these attributes appear in the Add Skill modal.
+      Leave blank to show all predefined attributes.
+      Example: DentalClinic_Skill,AnotherSkill
+
+Resources:
+  ProficiencyManagerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-handler
+      CodeUri:
+        Bucket: !Ref LambdaCodeBucket
+        Key: !Ref LambdaCodeKey
+      Handler: proficiency_manager.lambda_handler
+      Runtime: python3.13
+      Architectures:
+        - arm64
+      MemorySize: 128
+      Timeout: 10
+      Environment:
+        Variables:
+          CONNECT_INSTANCE_ID: !Ref ConnectInstanceId
+          CONNECT_INSTANCE_ARN: !Ref ConnectInstanceArn
+          LOG_LEVEL: INFO
+          ALLOWED_ATTRIBUTES: !Ref AllowedAttributes
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action:
+                - connect:ListUserProficiencies
+              Resource:
+                - !Sub arn:${AWS::Partition}:connect:${AWS::Region}:${AWS::AccountId}:instance/${ConnectInstanceId}/agent/*
+            - Effect: Allow
+              Action:
+                - connect:AssociateUserProficiencies
+                - connect:DisassociateUserProficiencies
+              Resource:
+                - "*"
+            - Effect: Allow
+              Action:
+                - connect:ListPredefinedAttributes
+                - connect:DescribePredefinedAttribute
+              Resource:
+                - !Sub arn:${AWS::Partition}:connect:${AWS::Region}:${AWS::AccountId}:instance/${ConnectInstanceId}
+
+  ProficiencyManagerFunctionUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !GetAtt ProficiencyManagerFunction.Arn
+      AuthType: NONE
+      InvokeMode: BUFFERED
+      Cors:
+        AllowCredentials: false
+        AllowHeaders:
+          - Content-Type
+        AllowMethods:
+          - GET
+          - PUT
+          - DELETE
+        AllowOrigins:
+          - !Ref FrontendOrigin
+        MaxAge: 300
+
+  ProficiencyManagerFunctionUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunctionUrl
+      FunctionName: !Ref ProficiencyManagerFunction
+      FunctionUrlAuthType: NONE
+      Principal: "*"
+
+  ProficiencyManagerFunctionInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ProficiencyManagerFunction
+      InvokedViaFunctionUrl: true
+      Principal: "*"
+
+Outputs:
+  FunctionUrl:
+    Description: Set REACT_APP_API_BASE_URL to this Lambda Function URL.
+    Value: !GetAtt ProficiencyManagerFunctionUrl.FunctionUrl
+  FunctionName:
+    Description: Lambda function name.
+    Value: !Ref ProficiencyManagerFunction
