@@ -12,29 +12,141 @@ Parameters:
     Description: S3 object key for the Lambda deployment ZIP.
   ConnectInstanceId:
     Type: String
-    Default: eefde7f8-7534-4dac-a433-f5a922235cc5
-    Description: Amazon Connect instance identifier.
+    Description: >
+      Amazon Connect instance identifier (the UUID at the end of the instance ARN).
+      Example: 5455ba30-b941-4270-a0bf-b3f57317121f
   ConnectInstanceArn:
     Type: String
-    Default: ""
     Description: >
-      Amazon Connect instance ARN
-      (arn:aws:connect:<region>:<account-id>:instance/<ConnectInstanceId>).
-      Required by the Lambda function at runtime.
-  FrontendOrigin:
+      Full Amazon Connect instance ARN.
+      Format: arn:aws:connect:<region>:<account-id>:instance/<ConnectInstanceId>
+      Example: arn:aws:connect:ap-southeast-2:123456789012:instance/5455ba30-b941-4270-a0bf-b3f57317121f
+  OktaIssuer:
     Type: String
-    Default: "*"
-    Description: CORS origin for the frontend. Use * for open test configuration, or set to your CloudFront domain.
+    Description: >
+      Okta tenant URL — provided by the client's Okta administrator.
+      Must match the iss claim in tokens issued by the Okta tenant.
+      Example: https://your-org.okta.com
+  OktaClientId:
+    Type: String
+    Description: >
+      Client ID of the Proficiency Manager OIDC application in Okta.
+      Provided by the client's Okta administrator after creating the OIDC app.
+      Example: 0oa1b2c3d4e5f6g7h8i9
   AllowedAttributes:
     Type: String
     Default: ""
     Description: >
-      Comma-separated list of predefined attribute names to expose in the app.
+      Optional comma-separated list of predefined attribute names to expose in the app.
       When set, only these attributes appear in the Add Skill modal.
       Leave blank to show all predefined attributes.
       Example: DentalClinic_Skill,AnotherSkill
+  FrontendBucketName:
+    Type: String
+    Description: >
+      Name of the S3 bucket that hosts the React frontend build.
+      Must be unique globally. Example: proficiency-manager-frontend
 
 Resources:
+
+  # ---------------------------------------------------------------------------
+  # S3 bucket for the React frontend (private — served via CloudFront only)
+  # ---------------------------------------------------------------------------
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref FrontendBucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub ${FrontendBucket.Arn}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}
+
+  # ---------------------------------------------------------------------------
+  # CloudFront Origin Access Control (replaces legacy OAI)
+  # ---------------------------------------------------------------------------
+  FrontendOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub ${AWS::StackName}-oac
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # ---------------------------------------------------------------------------
+  # CloudFront Response Headers Policy — adds the CSP header recommended by
+  # the Amazon Connect Agent Workspace Developer Guide so the app can only be
+  # embedded inside the Connect agent workspace iframe.
+  # ---------------------------------------------------------------------------
+  CSPResponseHeadersPolicy:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: !Sub ${AWS::StackName}-csp-policy
+        Comment: Restricts iframe embedding to Amazon Connect agent workspace only
+        SecurityHeadersConfig:
+          ContentSecurityPolicy:
+            ContentSecurityPolicy: "frame-ancestors https://*.awsapps.com https://*.my.connect.aws"
+            Override: true
+
+  # ---------------------------------------------------------------------------
+  # CloudFront distribution — serves the React frontend over HTTPS
+  # ---------------------------------------------------------------------------
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt FrontendOAC.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # CachingOptimized (managed)
+          ResponseHeadersPolicyId: !Ref CSPResponseHeadersPolicy
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          CachedMethods:
+            - GET
+            - HEAD
+        # Return index.html for all routes (SPA routing support)
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+        HttpVersion: http2
+        PriceClass: PriceClass_All
+
+  # ---------------------------------------------------------------------------
+  # Lambda function — handles proficiency management API calls
+  # ---------------------------------------------------------------------------
   ProficiencyManagerFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -52,8 +164,10 @@ Resources:
         Variables:
           CONNECT_INSTANCE_ID: !Ref ConnectInstanceId
           CONNECT_INSTANCE_ARN: !Ref ConnectInstanceArn
-          LOG_LEVEL: INFO
+          OKTA_ISSUER: !Ref OktaIssuer
+          OKTA_CLIENT_ID: !Ref OktaClientId
           ALLOWED_ATTRIBUTES: !Ref AllowedAttributes
+          LOG_LEVEL: INFO
       Policies:
         - Version: "2012-10-17"
           Statement:
@@ -85,12 +199,13 @@ Resources:
         AllowCredentials: false
         AllowHeaders:
           - Content-Type
+          - Authorization
         AllowMethods:
           - GET
           - PUT
           - DELETE
         AllowOrigins:
-          - !Ref FrontendOrigin
+          - !Sub https://${CloudFrontDistribution.DomainName}
         MaxAge: 300
 
   ProficiencyManagerFunctionUrlPermission:
@@ -110,9 +225,18 @@ Resources:
       Principal: "*"
 
 Outputs:
+  CloudFrontUrl:
+    Description: >
+      CloudFront distribution URL. Use this as the Access URL when registering
+      the app in Amazon Connect Integrations, and update the Okta OIDC app
+      sign-in redirect URI to this value.
+    Value: !Sub https://${CloudFrontDistribution.DomainName}
   FunctionUrl:
     Description: Set REACT_APP_API_BASE_URL to this Lambda Function URL.
     Value: !GetAtt ProficiencyManagerFunctionUrl.FunctionUrl
   FunctionName:
     Description: Lambda function name.
     Value: !Ref ProficiencyManagerFunction
+  FrontendBucketName:
+    Description: S3 bucket name for uploading the React frontend build.
+    Value: !Ref FrontendBucket

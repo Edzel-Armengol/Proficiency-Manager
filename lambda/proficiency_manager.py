@@ -3,6 +3,8 @@ import json
 import logging
 import os
 import re
+import time
+import urllib.request
 from typing import Any
 
 import boto3
@@ -14,6 +16,10 @@ LOGGER.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
 INSTANCE_ID = os.environ.get("CONNECT_INSTANCE_ID", "").strip()
 INSTANCE_ARN = os.environ.get("CONNECT_INSTANCE_ARN", "").strip()
+
+# Okta JWT validation configuration
+OKTA_ISSUER = os.environ.get("OKTA_ISSUER", "").strip()   # e.g. https://trial-7233824.okta.com
+OKTA_CLIENT_ID = os.environ.get("OKTA_CLIENT_ID", "").strip()  # OIDC app client ID
 
 # Optional comma-separated allowlist of predefined attribute names.
 # When set, only those attributes are returned by GET /attributes.
@@ -34,6 +40,12 @@ MAX_REQUEST_BODY_BYTES = 4096
 
 connect = boto3.client("connect")
 
+# ---------------------------------------------------------------------------
+# Simple in-memory JWKS cache — avoids fetching Okta's public keys on every
+# request. Refreshed automatically when the cache expires (1 hour TTL).
+# ---------------------------------------------------------------------------
+_jwks_cache: dict[str, Any] = {"keys": {}, "expires_at": 0}
+
 
 class RequestError(Exception):
     def __init__(self, status_code: int, message: str):
@@ -41,6 +53,192 @@ class RequestError(Exception):
         self.status_code = status_code
         self.message = message
 
+
+# ---------------------------------------------------------------------------
+# Okta JWT validation
+# ---------------------------------------------------------------------------
+
+def _fetch_jwks() -> dict[str, Any]:
+    """Fetch Okta's public keys from the JWKS endpoint and cache them."""
+    global _jwks_cache
+
+    now = time.time()
+    if now < _jwks_cache["expires_at"] and _jwks_cache["keys"]:
+        return _jwks_cache["keys"]
+
+    # Okta ID tokens issued by the org-level OIDC endpoint are signed with keys
+    # published at /oauth2/v1/keys (not the authorization server keys endpoint).
+    jwks_url = f"{OKTA_ISSUER}/oauth2/v1/keys"
+    try:
+        with urllib.request.urlopen(jwks_url, timeout=5) as resp:
+            jwks = json.loads(resp.read().decode("utf-8"))
+    except Exception as error:
+        LOGGER.error(f"Failed to fetch JWKS from Okta: {error}")
+        raise RequestError(503, "Authentication service is unavailable.")
+
+    # Index keys by kid (key ID) for fast lookup
+    keys_by_kid = {key["kid"]: key for key in jwks.get("keys", [])}
+    _jwks_cache = {"keys": keys_by_kid, "expires_at": now + 3600}
+    return keys_by_kid
+
+
+def _base64url_decode(value: str) -> bytes:
+    """Decode a base64url-encoded string (no padding required)."""
+    padding = 4 - len(value) % 4
+    if padding != 4:
+        value += "=" * padding
+    return base64.urlsafe_b64decode(value)
+
+
+def _decode_jwt_payload(token: str) -> dict[str, Any]:
+    """Decode the JWT payload without verifying the signature.
+    Signature verification is done separately using Okta's public keys.
+    """
+    parts = token.split(".")
+    if len(parts) != 3:
+        raise RequestError(401, "Invalid authorization token.")
+    try:
+        payload_bytes = _base64url_decode(parts[1])
+        return json.loads(payload_bytes.decode("utf-8"))
+    except Exception:
+        raise RequestError(401, "Invalid authorization token.")
+
+
+def _get_jwt_header(token: str) -> dict[str, Any]:
+    """Decode the JWT header to extract the key ID (kid)."""
+    parts = token.split(".")
+    if len(parts) != 3:
+        raise RequestError(401, "Invalid authorization token.")
+    try:
+        header_bytes = _base64url_decode(parts[0])
+        return json.loads(header_bytes.decode("utf-8"))
+    except Exception:
+        raise RequestError(401, "Invalid authorization token.")
+
+
+def _verify_jwt_signature(token: str, jwk: dict[str, Any]) -> None:
+    """Verify the JWT signature using the RSA public key from Okta's JWKS.
+
+    Uses only the Python standard library (no PyJWT or cryptography package)
+    so no additional Lambda layers are required.
+    """
+    import hashlib
+
+    parts = token.split(".")
+    message = f"{parts[0]}.{parts[1]}".encode("utf-8")
+    signature = _base64url_decode(parts[2])
+
+    # Decode RSA public key components from JWK
+    try:
+        n = int.from_bytes(_base64url_decode(jwk["n"]), "big")
+        e = int.from_bytes(_base64url_decode(jwk["e"]), "big")
+    except Exception:
+        raise RequestError(401, "Invalid authorization token.")
+
+    # RSA signature verification: signature^e mod n should equal the
+    # PKCS#1 v1.5 padded SHA-256 hash of the message.
+    try:
+        sig_int = int.from_bytes(signature, "big")
+        key_size = (n.bit_length() + 7) // 8
+        decrypted = pow(sig_int, e, n)
+        decrypted_bytes = decrypted.to_bytes(key_size, "big")
+    except Exception:
+        raise RequestError(401, "Invalid authorization token.")
+
+    # Verify PKCS#1 v1.5 padding and SHA-256 DigestInfo prefix
+    sha256_digest_info_prefix = bytes([
+        0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86,
+        0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05,
+        0x00, 0x04, 0x20,
+    ])
+    expected_suffix = sha256_digest_info_prefix + hashlib.sha256(message).digest()
+    expected_length = len(expected_suffix)
+
+    # PKCS#1 v1.5: 0x00 0x01 <padding 0xff bytes> 0x00 <DigestInfo>
+    if (
+        len(decrypted_bytes) < expected_length + 11
+        or decrypted_bytes[0] != 0x00
+        or decrypted_bytes[1] != 0x01
+        or decrypted_bytes[-(expected_length):] != expected_suffix
+        or decrypted_bytes[-(expected_length + 1)] != 0x00
+        or not all(b == 0xFF for b in decrypted_bytes[2:-(expected_length + 1)])
+    ):
+        raise RequestError(401, "Invalid authorization token.")
+
+
+def verify_okta_token(event: dict[str, Any]) -> dict[str, Any]:
+    """Extract and validate the Okta JWT from the Authorization header.
+
+    Returns the decoded token payload on success.
+    Raises RequestError(401) on any validation failure.
+    """
+    if not OKTA_ISSUER or not OKTA_CLIENT_ID:
+        raise RuntimeError("OKTA_ISSUER and OKTA_CLIENT_ID are required")
+
+    # Extract Bearer token from Authorization header
+    headers = {k.lower(): v for k, v in (event.get("headers") or {}).items()}
+    auth_header = headers.get("authorization", "")
+    if not auth_header.lower().startswith("bearer "):
+        raise RequestError(401, "Authorization token is required.")
+
+    token = auth_header[7:].strip()
+    if not token:
+        raise RequestError(401, "Authorization token is required.")
+
+    # Decode header and payload (no signature check yet)
+    jwt_header = _get_jwt_header(token)
+    payload = _decode_jwt_payload(token)
+
+    # Validate issuer
+    token_issuer = payload.get("iss", "")
+    if token_issuer != OKTA_ISSUER:
+        LOGGER.warning(f"JWT issuer mismatch: {token_issuer}")
+        raise RequestError(401, "Invalid authorization token.")
+
+    # Validate audience — for ID tokens, aud is always the OIDC client ID
+    aud = payload.get("aud", "")
+    if isinstance(aud, str):
+        aud = [aud]
+    if OKTA_CLIENT_ID not in aud:
+        LOGGER.warning(f"JWT audience mismatch: {aud}")
+        raise RequestError(401, "Invalid authorization token.")
+
+    # Validate expiry
+    exp = payload.get("exp", 0)
+    if time.time() > exp:
+        raise RequestError(401, "Authorization token has expired.")
+
+    # Fetch Okta public keys and verify signature
+    kid = jwt_header.get("kid")
+    if not kid:
+        raise RequestError(401, "Invalid authorization token.")
+
+    jwks = _fetch_jwks()
+    jwk = jwks.get(kid)
+
+    if not jwk:
+        # Key not in cache — force a refresh once in case Okta rotated keys
+        _jwks_cache["expires_at"] = 0
+        jwks = _fetch_jwks()
+        jwk = jwks.get(kid)
+
+    if not jwk:
+        LOGGER.warning(f"JWT kid not found in JWKS: {kid}")
+        raise RequestError(401, "Invalid authorization token.")
+
+    _verify_jwt_signature(token, jwk)
+
+    LOGGER.info(json.dumps({
+        "event": "token_verified",
+        "subject": payload.get("sub", "unknown"),
+    }))
+
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# Lambda handler
+# ---------------------------------------------------------------------------
 
 def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     request_id = getattr(context, "aws_request_id", "unknown")
@@ -53,6 +251,13 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
 
         method = event.get("requestContext", {}).get("http", {}).get("method", "")
         path = (event.get("rawPath") or "/").rstrip("/") or "/"
+
+        # Allow CORS preflight requests through without auth
+        if method == "OPTIONS":
+            return response(200, {})
+
+        # Validate Okta JWT on every non-OPTIONS request
+        verify_okta_token(event)
 
         # GET /attributes — list all predefined attribute names and values
         if method == "GET" and path.endswith("/attributes"):

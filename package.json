@@ -7,6 +7,7 @@
     "@amazon-connect/contact": "^1.0.12",
     "@amazon-connect/theme": "^1.0.12",
     "@cloudscape-design/components": "^3.0.0",
+    "@okta/okta-auth-js": "7.7.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
     "react-scripts": "5.0.1"
